@@ -555,3 +555,98 @@ describe('C++ return-type inference via function return type', () => {
     expect(saveCall).toBeDefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Nullable receiver unwrapping: User* pointer type stripped for resolution
+// ---------------------------------------------------------------------------
+
+describe('C++ nullable receiver resolution (pointer types)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-nullable-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes with competing save methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter((m: string) => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves user->save() to User#save via pointer receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath.includes('User.h'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves repo->save() to Repo#save via pointer receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath.includes('Repo.h'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('does NOT cross-contaminate (exactly 1 save per receiver file)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save' && c.source === 'processEntities');
+    const userTargeted = saveCalls.filter(c => c.targetFilePath.includes('User.h'));
+    const repoTargeted = saveCalls.filter(c => c.targetFilePath.includes('Repo.h'));
+    expect(userTargeted.length).toBe(1);
+    expect(repoTargeted.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C++ assignment chain propagation: auto alias = u; alias.save()
+// Tests extractPendingAssignment for C++ auto declarations.
+// ---------------------------------------------------------------------------
+
+describe('C++ assignment chain propagation (auto alias)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'cpp-assignment-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveMethods = getNodesByLabel(result, 'Method').filter(m => m === 'save');
+    expect(saveMethods.length).toBe(2);
+  });
+
+  it('resolves alias.save() to User#save via auto assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath?.includes('User.h'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('resolves rAlias.save() to Repo#save via auto assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'processEntities' && c.targetFilePath?.includes('Repo.h'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('each alias resolves to its own class, not the other', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save' && c.source === 'processEntities');
+    const userTargeted = saveCalls.filter(c => c.targetFilePath?.includes('User.h'));
+    const repoTargeted = saveCalls.filter(c => c.targetFilePath?.includes('Repo.h'));
+    expect(userTargeted.length).toBe(1);
+    expect(repoTargeted.length).toBe(1);
+  });
+});

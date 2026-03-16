@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { ConstructorBindingScanner, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor } from './types.js';
+import type { ConstructorBindingScanner, LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, PendingAssignmentExtractor } from './types.js';
 import { extractSimpleTypeName, extractVarName } from './shared.js';
 
 const DECLARATION_NODE_TYPES: ReadonlySet<string> = new Set([
@@ -181,9 +181,53 @@ const scanConstructorBinding: ConstructorBindingScanner = (node) => {
   return { varName: leftIds[0].text, calleeName };
 };
 
+/** Go: alias := u (short_var_declaration) or var b = u (var_spec) */
+const extractPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
+  if (node.type === 'short_var_declaration') {
+    const left = node.childForFieldName('left');
+    const right = node.childForFieldName('right');
+    if (!left || !right) return undefined;
+    const lhsNode = left.type === 'expression_list' ? left.firstNamedChild : left;
+    const rhsNode = right.type === 'expression_list' ? right.firstNamedChild : right;
+    if (!lhsNode || !rhsNode) return undefined;
+    if (lhsNode.type !== 'identifier') return undefined;
+    const lhs = lhsNode.text;
+    if (scopeEnv.has(lhs)) return undefined;
+    if (rhsNode.type === 'identifier') return { lhs, rhs: rhsNode.text };
+    return undefined;
+  }
+  if (node.type === 'var_spec' || node.type === 'var_declaration') {
+    // var_declaration contains var_spec children; var_spec has name + expression_list value
+    const specs: SyntaxNode[] = [];
+    if (node.type === 'var_declaration') {
+      for (let i = 0; i < node.namedChildCount; i++) {
+        const c = node.namedChild(i);
+        if (c?.type === 'var_spec') specs.push(c);
+      }
+    } else {
+      specs.push(node);
+    }
+    for (const spec of specs) {
+      const nameNode = spec.childForFieldName('name');
+      if (!nameNode || nameNode.type !== 'identifier') continue;
+      const lhs = nameNode.text;
+      if (scopeEnv.has(lhs)) continue;
+      // Check if the last named child is a bare identifier (no type annotation between name and value)
+      let exprList: SyntaxNode | null = null;
+      for (let i = 0; i < spec.childCount; i++) {
+        if (spec.child(i)?.type === 'expression_list') { exprList = spec.child(i); break; }
+      }
+      const rhsNode = exprList?.firstNamedChild;
+      if (rhsNode?.type === 'identifier') return { lhs, rhs: rhsNode.text };
+    }
+  }
+  return undefined;
+};
+
 export const typeConfig: LanguageTypeConfig = {
   declarationNodeTypes: DECLARATION_NODE_TYPES,
   extractDeclaration,
   extractParameter,
   scanConstructorBinding,
+  extractPendingAssignment,
 };

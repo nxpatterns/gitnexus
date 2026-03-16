@@ -1,5 +1,5 @@
 import type { SyntaxNode } from '../utils.js';
-import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner } from './types.js';
+import type { LanguageTypeConfig, ParameterExtractor, TypeBindingExtractor, InitializerExtractor, ClassNameLookup, ConstructorBindingScanner, ForLoopExtractor, PendingAssignmentExtractor } from './types.js';
 import { extractSimpleTypeName, extractVarName, findChildByType } from './shared.js';
 
 // ── Java ──────────────────────────────────────────────────────────────────
@@ -73,7 +73,7 @@ const scanJavaConstructorBinding: ConstructorBindingScanner = (node) => {
   const typeNode = node.childForFieldName('type');
   if (!typeNode) return undefined;
   if (typeNode.text !== 'var') return undefined;
-  const declarator = node.namedChildren.find((c: SyntaxNode) => c.type === 'variable_declarator');
+  const declarator = findChildByType(node, 'variable_declarator');
   if (!declarator) return undefined;
   const nameNode = declarator.childForFieldName('name');
   const value = declarator.childForFieldName('value');
@@ -85,12 +85,44 @@ const scanJavaConstructorBinding: ConstructorBindingScanner = (node) => {
   return { varName: nameNode.text, calleeName: methodName.text };
 };
 
+const JAVA_FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set([
+  'enhanced_for_statement',
+]);
+
+/** Java: for (User user : users) — extract loop variable binding */
+const extractJavaForLoopBinding: ForLoopExtractor = (node: SyntaxNode, scopeEnv: Map<string, string>): void => {
+  const typeNode = node.childForFieldName('type');
+  const nameNode = node.childForFieldName('name');
+  if (!typeNode || !nameNode) return;
+  const typeName = extractSimpleTypeName(typeNode);
+  const varName = extractVarName(nameNode);
+  if (typeName && varName) scopeEnv.set(varName, typeName);
+};
+
+/** Java: var alias = u → local_variable_declaration > variable_declarator with name/value */
+const extractJavaPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
+  for (let i = 0; i < node.namedChildCount; i++) {
+    const child = node.namedChild(i);
+    if (!child || child.type !== 'variable_declarator') continue;
+    const nameNode = child.childForFieldName('name');
+    const valueNode = child.childForFieldName('value');
+    if (!nameNode || !valueNode) continue;
+    const lhs = nameNode.text;
+    if (scopeEnv.has(lhs)) continue;
+    if (valueNode.type === 'identifier' || valueNode.type === 'simple_identifier') return { lhs, rhs: valueNode.text };
+  }
+  return undefined;
+};
+
 export const javaTypeConfig: LanguageTypeConfig = {
   declarationNodeTypes: JAVA_DECLARATION_NODE_TYPES,
   extractDeclaration: extractJavaDeclaration,
   extractParameter: extractJavaParameter,
   extractInitializer: extractJavaInitializer,
   scanConstructorBinding: scanJavaConstructorBinding,
+  forLoopNodeTypes: JAVA_FOR_LOOP_NODE_TYPES,
+  extractForLoopBinding: extractJavaForLoopBinding,
+  extractPendingAssignment: extractJavaPendingAssignment,
 };
 
 // ── Kotlin ────────────────────────────────────────────────────────────────
@@ -188,10 +220,10 @@ const extractKotlinInitializer: InitializerExtractor = (node: SyntaxNode, env: M
 /** Kotlin: val x = User(...) — constructor binding for property_declaration with call_expression */
 const scanKotlinConstructorBinding: ConstructorBindingScanner = (node) => {
   if (node.type !== 'property_declaration') return undefined;
-  const varDecl = node.namedChildren.find(c => c.type === 'variable_declaration');
+  const varDecl = findChildByType(node, 'variable_declaration');
   if (!varDecl) return undefined;
-  if (varDecl.namedChildren.some(c => c.type === 'user_type')) return undefined;
-  const callExpr = node.namedChildren.find(c => c.type === 'call_expression');
+  if (findChildByType(varDecl, 'user_type')) return undefined;
+  const callExpr = findChildByType(node, 'call_expression');
   if (!callExpr) return undefined;
   const callee = callExpr.firstNamedChild;
   if (!callee) return undefined;
@@ -210,15 +242,88 @@ const scanKotlinConstructorBinding: ConstructorBindingScanner = (node) => {
     }
   }
   if (!calleeName) return undefined;
-  const nameNode = varDecl.namedChildren.find(c => c.type === 'simple_identifier');
+  const nameNode = findChildByType(varDecl, 'simple_identifier');
   if (!nameNode) return undefined;
   return { varName: nameNode.text, calleeName };
 };
 
+const KOTLIN_FOR_LOOP_NODE_TYPES: ReadonlySet<string> = new Set([
+  'for_statement',
+]);
+
+/** Kotlin: for (user: User in users) — extract loop variable binding when explicit type annotation exists */
+const extractKotlinForLoopBinding: ForLoopExtractor = (node: SyntaxNode, scopeEnv: Map<string, string>): void => {
+  // Kotlin loop variable: variable_declaration child with optional user_type annotation
+  const varDecl = findChildByType(node, 'variable_declaration');
+  if (!varDecl) return;
+  // Only extract when there is an explicit type annotation (user_type node)
+  const typeNode = findChildByType(varDecl, 'user_type');
+  if (!typeNode) return;
+  const nameNode = findChildByType(varDecl, 'simple_identifier');
+  if (!nameNode) return;
+  const typeName = extractSimpleTypeName(typeNode);
+  const varName = extractVarName(nameNode);
+  if (typeName && varName) scopeEnv.set(varName, typeName);
+};
+
+/** Kotlin: val alias = u → property_declaration or variable_declaration.
+ *  property_declaration has: binding_pattern_kind("val"), variable_declaration("alias"),
+ *  "=", and the RHS value (simple_identifier "u").
+ *  variable_declaration appears directly inside functions and has simple_identifier children. */
+const extractKotlinPendingAssignment: PendingAssignmentExtractor = (node, scopeEnv) => {
+  if (node.type === 'property_declaration') {
+    // Find the variable name from variable_declaration child
+    const varDecl = findChildByType(node, 'variable_declaration');
+    if (!varDecl) return undefined;
+    const nameNode = varDecl.firstNamedChild;
+    if (!nameNode || nameNode.type !== 'simple_identifier') return undefined;
+    const lhs = nameNode.text;
+    if (scopeEnv.has(lhs)) return undefined;
+    // Find the RHS: a simple_identifier sibling after the "=" token
+    let foundEq = false;
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (!child) continue;
+      if (child.type === '=') { foundEq = true; continue; }
+      if (foundEq && child.type === 'simple_identifier') {
+        return { lhs, rhs: child.text };
+      }
+    }
+    return undefined;
+  }
+
+  if (node.type === 'variable_declaration') {
+    // variable_declaration directly inside functions: simple_identifier children
+    const nameNode = findChildByType(node, 'simple_identifier');
+    if (!nameNode) return undefined;
+    const lhs = nameNode.text;
+    if (scopeEnv.has(lhs)) return undefined;
+    // Look for RHS simple_identifier after "=" in the parent (property_declaration)
+    // variable_declaration itself doesn't contain "=" — it's in the parent
+    const parent = node.parent;
+    if (!parent) return undefined;
+    let foundEq = false;
+    for (let i = 0; i < parent.childCount; i++) {
+      const child = parent.child(i);
+      if (!child) continue;
+      if (child.type === '=') { foundEq = true; continue; }
+      if (foundEq && child.type === 'simple_identifier') {
+        return { lhs, rhs: child.text };
+      }
+    }
+    return undefined;
+  }
+
+  return undefined;
+};
+
 export const kotlinTypeConfig: LanguageTypeConfig = {
   declarationNodeTypes: KOTLIN_DECLARATION_NODE_TYPES,
+  forLoopNodeTypes: KOTLIN_FOR_LOOP_NODE_TYPES,
   extractDeclaration: extractKotlinDeclaration,
   extractParameter: extractKotlinParameter,
   extractInitializer: extractKotlinInitializer,
   scanConstructorBinding: scanKotlinConstructorBinding,
+  extractForLoopBinding: extractKotlinForLoopBinding,
+  extractPendingAssignment: extractKotlinPendingAssignment,
 };

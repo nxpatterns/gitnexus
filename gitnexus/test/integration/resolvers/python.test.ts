@@ -720,3 +720,232 @@ describe('Python static/classmethod class resolution (issue #289)', () => {
     expect(findCalls.length === 0 || findCalls.length === 2).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Nullable receiver: user: User | None = find_user(); user.save()
+// Python 3.10+ union syntax — stripNullable unwraps `User | None` → `User`
+// ---------------------------------------------------------------------------
+
+describe('Python nullable receiver resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-nullable-receiver'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes, both with save functions', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves user.save() to User.save via nullable receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'user.py');
+    expect(userSave).toBeDefined();
+    expect(userSave!.source).toBe('process_entities');
+  });
+
+  it('resolves repo.save() to Repo.save via nullable receiver typing', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c => c.target === 'save' && c.targetFilePath === 'repo.py');
+    expect(repoSave).toBeDefined();
+    expect(repoSave!.source).toBe('process_entities');
+  });
+
+  it('user.save() does NOT resolve to Repo.save (negative disambiguation)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save' && c.source === 'process_entities');
+    // Each save() call should resolve to exactly one target file
+    const userSaveToRepo = saveCalls.filter(c => c.targetFilePath === 'repo.py');
+    const repoSaveToUser = saveCalls.filter(c => c.targetFilePath === 'user.py');
+    // Exactly 1 edge to each file (not 2 to either)
+    expect(userSaveToRepo.length).toBe(1);
+    expect(repoSaveToUser.length).toBe(1);
+  });
+
+  it('emits exactly 2 save() CALLS edges (one per receiver type)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter(c => c.target === 'save');
+    expect(saveCalls.length).toBe(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Assignment chain propagation (Phase 4.3)
+// ---------------------------------------------------------------------------
+
+describe('Python assignment chain propagation', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-assignment-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves alias.save() to User#save via assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Positive: alias.save() must resolve to User#save
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('user.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('alias.save() does NOT resolve to Repo#save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Negative: only one save call from process to User#save
+    const wrongCall = calls.filter(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('user.py'),
+    );
+    expect(wrongCall.length).toBe(1);
+  });
+
+  it('resolves r_alias.save() to Repo#save via assignment chain', () => {
+    const calls = getRelationships(result, 'CALLS');
+    // Positive: r_alias.save() must resolve to Repo#save
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('repo.py'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('each alias resolves to its own class, not the other', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('user.py'),
+    );
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'process' && c.targetFilePath.includes('repo.py'),
+    );
+    expect(userSave).toBeDefined();
+    expect(repoSave).toBeDefined();
+    expect(userSave!.targetFilePath).not.toBe(repoSave!.targetFilePath);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Python nullable (User | None) + assignment chain combined.
+// Python 3.10+ union syntax is parsed as binary_operator by tree-sitter,
+// stored as raw text "User | None" in TypeEnv. stripNullable's
+// NULLABLE_KEYWORDS.has() path must resolve it at lookup time.
+// ---------------------------------------------------------------------------
+
+describe('Python nullable (User | None) + assignment chain combined', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-nullable-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save method', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves alias.save() to User#save when source is User | None', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'nullable_chain_user' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('alias.save() from User | None does NOT resolve to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'nullable_chain_user' && c.targetFilePath?.includes('repo.py'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+
+  it('resolves alias.save() to Repo#save when source is Repo | None', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'nullable_chain_repo' && c.targetFilePath?.includes('repo.py'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('alias.save() from Repo | None does NOT resolve to User#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'nullable_chain_repo' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Python walrus operator (:=) assignment chain.
+// Tests that extractPendingAssignment handles named_expression nodes
+// in addition to regular assignment nodes.
+// ---------------------------------------------------------------------------
+
+describe('Python walrus operator (:=) assignment chain', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'python-walrus-chain'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes each with a save function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Repo');
+    const saveFns = getNodesByLabel(result, 'Function').filter(m => m === 'save');
+    expect(saveFns.length).toBe(2);
+  });
+
+  it('resolves alias.save() to User#save via regular + walrus chains', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(c =>
+      c.target === 'save' && c.source === 'walrus_chain_user' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('save() in walrus_chain_user does NOT resolve to Repo#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'walrus_chain_user' && c.targetFilePath?.includes('repo.py'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+
+  it('resolves alias.save() to Repo#save via regular + walrus chains', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(c =>
+      c.target === 'save' && c.source === 'walrus_chain_repo' && c.targetFilePath?.includes('repo.py'),
+    );
+    expect(repoSave).toBeDefined();
+  });
+
+  it('save() in walrus_chain_repo does NOT resolve to User#save (negative)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongCall = calls.find(c =>
+      c.target === 'save' && c.source === 'walrus_chain_repo' && c.targetFilePath?.includes('user.py'),
+    );
+    expect(wrongCall).toBeUndefined();
+  });
+});
