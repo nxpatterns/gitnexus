@@ -359,8 +359,10 @@ export const executeQuery = async (cypher: string, readOnly = true): Promise<any
   }
 
   if (readOnly) {
-    const upper = cypher.toUpperCase();
-    if (/\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|DETACH)\b/.test(upper)) {
+    // Strip quoted strings before checking for write keywords, so that
+    // queries like WHERE n.name CONTAINS "delete" are not blocked.
+    const stripped = cypher.replace(/'[^']*'|"[^"]*"/g, '').toUpperCase();
+    if (/\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|DETACH)\b/.test(stripped)) {
       throw new Error('Read-only query attempted a write operation');
     }
   }

@@ -20,8 +20,10 @@ const validRelType = (t: string): boolean =>
 const isSafeId = (id: string): boolean =>
   /^[a-zA-Z0-9_:.\-/@]+$/.test(id);
 
-const isWriteQuery = (cypher: string): boolean =>
-  /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|DETACH)\b/.test(cypher.toUpperCase());
+const isWriteQuery = (cypher: string): boolean => {
+  const stripped = cypher.replace(/'[^']*'|"[^"]*"/g, '').toUpperCase();
+  return /\b(CREATE|DELETE|SET|MERGE|REMOVE|DROP|DETACH)\b/.test(stripped);
+};
 
 // ===========================================================================
 // validLabel
@@ -195,12 +197,18 @@ describe('readOnly guard – write-operation detection', () => {
       expect(isWriteQuery('Match (n) Set n.x = 1')).toBe(true);
     });
 
-    // Known limitation: the regex matches the keyword DELETE even when it
-    // appears inside a string literal value. This is a deliberate tradeoff --
-    // false-positive blocking is safer than false-negative allowing writes.
-    it('flags "delete" inside a string value (known over-blocking)', () => {
-      const cypher = 'MATCH (n) WHERE n.name CONTAINS "delete" RETURN n';
-      expect(isWriteQuery(cypher)).toBe(true);
+    // Keywords inside quoted strings are stripped before checking,
+    // so they don't trigger false positives.
+    it('allows "delete" inside a quoted string value', () => {
+      expect(isWriteQuery('MATCH (n) WHERE n.name CONTAINS "delete" RETURN n')).toBe(false);
+    });
+
+    it('allows "CREATE" inside single-quoted string', () => {
+      expect(isWriteQuery("MATCH (n) WHERE n.name = 'CREATE_USER' RETURN n")).toBe(false);
+    });
+
+    it('still blocks DELETE outside quotes', () => {
+      expect(isWriteQuery('MATCH (n) WHERE n.name = "foo" DELETE n')).toBe(true);
     });
 
     // Verify the word-boundary prevents false positives on substrings that
