@@ -15,7 +15,7 @@ import {
   closeLbug,
   isLbugReady,
   isWriteQuery,
-} from '../core/lbug-adapter.js';
+} from '../../core/lbug/pool-adapter.js';
 export { isWriteQuery };
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
@@ -26,6 +26,7 @@ import {
   cleanupOldKuzuFiles,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
+import { GroupService, type GroupToolPort } from '../../core/group/service.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -175,6 +176,28 @@ export class LocalBackend {
   private initializedRepos: Set<string> = new Set();
   private reinitPromises: Map<string, Promise<void>> = new Map();
   private lastStalenessCheck: Map<string, number> = new Map();
+  private groupToolSvc: GroupService | null = null;
+
+  /**
+   * Cross-repo group tools (CLI). Shares logic with MCP `group_*` handlers.
+   */
+  getGroupService(): GroupService {
+    if (!this.groupToolSvc) {
+      const port: GroupToolPort = {
+        resolveRepo: (p) => this.resolveRepo(p),
+        impact: (r, p) => this.impact(r as RepoHandle, p),
+        query: (r, p) => this.query(r as RepoHandle, p),
+        impactByUid: (id, uid, d, o) => this.impactByUid(id, uid, d, o),
+      };
+      this.groupToolSvc = new GroupService(port);
+    }
+    return this.groupToolSvc;
+  }
+
+  /** Close all pooled LadybugDB connections (CLI one-shot; optional for long-lived MCP). */
+  async dispose(): Promise<void> {
+    await closeLbug();
+  }
 
   // ─── Initialization ──────────────────────────────────────────────
 
@@ -428,6 +451,10 @@ export class LocalBackend {
   async callTool(method: string, params: any): Promise<any> {
     if (method === 'list_repos') {
       return this.listRepos();
+    }
+
+    if (method.startsWith('group_')) {
+      return this.handleGroupTool(method, params || {});
     }
 
     // Resolve repo from optional param (re-reads registry on miss)
@@ -1854,9 +1881,6 @@ export class LocalBackend {
     const includeTests = params.includeTests ?? false;
     const minConfidence = params.minConfidence ?? 0;
 
-    const relTypeFilter = relationTypes.map((t) => `'${t}'`).join(', ');
-    const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
-
     // Resolve target by name, preferring Class/Interface over Constructor
     // (fix #480: Java class and constructor share the same name).
     // labels(n)[0] returns empty string in LadybugDB, so we use explicit
@@ -1916,6 +1940,33 @@ export class LocalBackend {
     }
 
     if (!sym) return { error: `Target '${target}' not found` };
+
+    return this._runImpactBFS(repo, sym, symType, direction, {
+      maxDepth,
+      relationTypes,
+      includeTests,
+      minConfidence,
+    });
+  }
+
+  /**
+   * Shared BFS traversal for impact analysis (name-resolved or UID-resolved symbol).
+   */
+  private async _runImpactBFS(
+    repo: RepoHandle,
+    sym: any,
+    symType: string,
+    direction: 'upstream' | 'downstream',
+    opts: {
+      maxDepth: number;
+      relationTypes: string[];
+      includeTests: boolean;
+      minConfidence: number;
+    },
+  ): Promise<any> {
+    const { maxDepth, relationTypes, includeTests, minConfidence } = opts;
+    const relTypeFilter = relationTypes.map((t) => `'${t}'`).join(', ');
+    const confidenceFilter = minConfidence > 0 ? ` AND r.confidence >= ${minConfidence}` : '';
 
     const symId = sym.id || sym[0];
 
@@ -2321,6 +2372,110 @@ export class LocalBackend {
       affected_modules: affectedModules,
       byDepth: grouped,
     };
+  }
+
+  /**
+   * UID-based impact for cross-repo fan-out. Same result shape as `impact`.
+   * Returns null if the repo is unknown, the UID is missing, or analysis fails.
+   */
+  async impactByUid(
+    repoId: string,
+    uid: string,
+    direction: string,
+    opts: {
+      maxDepth: number;
+      relationTypes: string[];
+      minConfidence: number;
+      includeTests: boolean;
+    },
+  ): Promise<any | null> {
+    try {
+      await this.refreshRepos();
+      await this.ensureInitialized(repoId);
+    } catch {
+      return null;
+    }
+
+    const repo = this.repos.get(repoId);
+    if (!repo) return null;
+
+    const dir: 'upstream' | 'downstream' = direction === 'downstream' ? 'downstream' : 'upstream';
+
+    let rows: any[];
+    try {
+      rows = await executeParameterized(
+        repoId,
+        `MATCH (n) WHERE n.id = $uid
+         RETURN n.id AS id, n.name AS name, n.filePath AS filePath, labels(n)[0] AS type
+         LIMIT 1`,
+        { uid },
+      );
+    } catch {
+      return null;
+    }
+    if (!rows?.length) return null;
+
+    const sym = rows[0];
+    const labelRaw = sym.type ?? sym[3];
+    const symType =
+      typeof labelRaw === 'string' && labelRaw.trim().length > 0 ? labelRaw.trim() : '';
+
+    const rawRelTypes =
+      opts.relationTypes && opts.relationTypes.length > 0
+        ? opts.relationTypes.filter((t) => VALID_RELATION_TYPES.has(t))
+        : ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS'];
+    const relationTypes =
+      rawRelTypes.length > 0 ? rawRelTypes : ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS'];
+
+    try {
+      return await this._runImpactBFS(repo, sym, symType, dir, {
+        maxDepth: opts.maxDepth,
+        relationTypes,
+        includeTests: opts.includeTests,
+        minConfidence: opts.minConfidence,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  private handleGroupTool(method: string, params: Record<string, unknown>): Promise<unknown> {
+    switch (method) {
+      case 'group_list':
+        return this.groupList(params);
+      case 'group_sync':
+        return this.groupSync(params);
+      case 'group_contracts':
+        return this.groupContracts(params);
+      case 'group_query':
+        return this.groupQuery(params);
+      case 'group_status':
+        return this.groupStatus(params);
+      default:
+        throw new Error(`Unknown group tool: ${method}`);
+    }
+  }
+
+  private async groupList(params: Record<string, unknown>): Promise<unknown> {
+    return this.getGroupService().groupList(params);
+  }
+
+  private async groupSync(params: Record<string, unknown>): Promise<unknown> {
+    return this.getGroupService().groupSync(params);
+  }
+
+  private async groupContracts(params: Record<string, unknown>): Promise<unknown> {
+    return this.getGroupService().groupContracts(params);
+  }
+
+  private async groupQuery(params: Record<string, unknown>): Promise<unknown> {
+    await this.refreshRepos();
+    return this.getGroupService().groupQuery(params);
+  }
+
+  private async groupStatus(params: Record<string, unknown>): Promise<unknown> {
+    await this.refreshRepos();
+    return this.getGroupService().groupStatus(params);
   }
 
   /**

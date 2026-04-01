@@ -9,17 +9,29 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// We need to mock the LadybugDB adapter and repo-manager BEFORE importing LocalBackend
-vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
-  const actual = await importOriginal();
-  return {
-    ...actual,
+// We need to mock the LadybugDB adapter and repo-manager BEFORE importing LocalBackend.
+// local-backend.ts imports from core/lbug/pool-adapter.js; the mcp/core/lbug-adapter.js
+// re-exports from the same module, so we mock the canonical source.
+// vi.hoisted runs before vi.mock hoisting, making the fns available to both factories.
+const { lbugMocks } = vi.hoisted(() => ({
+  lbugMocks: {
     initLbug: vi.fn().mockResolvedValue(undefined),
     executeQuery: vi.fn().mockResolvedValue([]),
     executeParameterized: vi.fn().mockResolvedValue([]),
     closeLbug: vi.fn().mockResolvedValue(undefined),
     isLbugReady: vi.fn().mockReturnValue(true),
-  };
+  },
+}));
+
+vi.mock('../../src/core/lbug/pool-adapter.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, ...lbugMocks };
+});
+
+// Re-export shim must resolve to the same mocks
+vi.mock('../../src/mcp/core/lbug-adapter.js', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, ...lbugMocks };
 });
 
 vi.mock('../../src/storage/repo-manager.js', () => ({

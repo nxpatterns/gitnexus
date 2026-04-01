@@ -377,4 +377,80 @@ Returns: single route object when one match, or { routes: [...], total: N } for 
       required: [],
     },
   },
+  {
+    name: 'group_list',
+    description: `List all configured repository groups, or return details for one group (repos, manifest links).
+
+WHEN TO USE: Discover groups before group_sync. Optional "name" returns a single group's config.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Group name. Omit to list all groups.' },
+      },
+      required: [],
+    },
+  },
+  {
+    name: 'group_sync',
+    description: `Rebuild the Contract Registry (contracts.json) for a group: extract HTTP contracts, apply manifest links, exact-match cross-links.
+
+WHEN TO USE: After changing group.yaml or re-indexing member repos.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Group name' },
+        skipEmbeddings: {
+          type: 'boolean',
+          description: 'Exact + BM25 only (Demo PR: same as default exact path)',
+        },
+        exactOnly: { type: 'boolean', description: 'Exact match only in cascade' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'group_contracts',
+    description: `Inspect contracts and cross-links from the group's contracts.json.
+
+WHEN TO USE: Debug cross-repo links after group_sync.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Group name' },
+        type: { type: 'string', description: 'Filter by contract type (http, topic, …)' },
+        repo: { type: 'string', description: 'Filter by group repo path (e.g. app/backend)' },
+        unmatchedOnly: { type: 'boolean', description: 'Only contracts with no cross-link' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'group_query',
+    description: `Run the query tool across all repos in a group and merge process results via reciprocal rank fusion.
+
+WHEN TO USE: Semantic / hybrid search across a whole product group.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Group name' },
+        query: { type: 'string', description: 'Search query' },
+        subgroup: { type: 'string', description: 'Limit to repo paths under this prefix' },
+        limit: { type: 'number', description: 'Max merged results (default 5)' },
+      },
+      required: ['name', 'query'],
+    },
+  },
+  {
+    name: 'group_status',
+    description: `Report index staleness (commit vs HEAD) and Contract Registry staleness (indexedAt) for each repo in a group.
+
+WHEN TO USE: Before group_sync or when agents should refresh indexes.`,
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Group name' },
+      },
+      required: ['name'],
+    },
+  },
 ];

@@ -2,7 +2,7 @@
  * Unit Tests: MCP Tool Definitions
  *
  * Tests: GITNEXUS_TOOLS from tools.ts
- * - All 7 tools are defined
+ * - All 16 tools are defined (per-repo + group_*)
  * - Each tool has valid name, description, inputSchema
  * - Required fields are correct
  * - Optional repo parameter is present on tools that need it
@@ -10,9 +10,17 @@
 import { describe, it, expect } from 'vitest';
 import { GITNEXUS_TOOLS } from '../../src/mcp/tools.js';
 
+const GROUP_TOOLS = new Set([
+  'group_list',
+  'group_sync',
+  'group_contracts',
+  'group_query',
+  'group_status',
+]);
+
 describe('GITNEXUS_TOOLS', () => {
-  it('exports all tools (7 base + 3 route/tool/shape + 1 api_impact)', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(11);
+  it('exports all tools (7 base + 3 route/tool/shape + 1 api_impact + 5 group)', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(16);
   });
 
   it('contains all expected tool names', () => {
@@ -83,14 +91,33 @@ describe('GITNEXUS_TOOLS', () => {
     expect(listTool.inputSchema.required).toEqual([]);
   });
 
-  it('all tools except list_repos have optional repo parameter', () => {
+  it('per-repo tools have optional repo parameter for backend selection', () => {
     for (const tool of GITNEXUS_TOOLS) {
       if (tool.name === 'list_repos') continue;
+      if (GROUP_TOOLS.has(tool.name)) continue;
       expect(tool.inputSchema.properties.repo).toBeDefined();
       expect(tool.inputSchema.properties.repo.type).toBe('string');
-      // repo should never be required
       expect(tool.inputSchema.required).not.toContain('repo');
     }
+  });
+
+  it('group_contracts has optional repo filter', () => {
+    const groupContracts = GITNEXUS_TOOLS.find((t) => t.name === 'group_contracts')!;
+    expect(groupContracts.inputSchema.properties).toHaveProperty('repo');
+    expect(groupContracts.inputSchema.required).not.toContain('repo');
+  });
+
+  it('group tools without backend repo param omit repo property', () => {
+    for (const name of ['group_list', 'group_status', 'group_sync', 'group_query'] as const) {
+      const tool = GITNEXUS_TOOLS.find((t) => t.name === name)!;
+      expect(tool.inputSchema.properties).not.toHaveProperty('repo');
+    }
+  });
+
+  it('group_query requires name and query', () => {
+    const groupQuery = GITNEXUS_TOOLS.find((t) => t.name === 'group_query')!;
+    expect(groupQuery.inputSchema.required).toContain('name');
+    expect(groupQuery.inputSchema.required).toContain('query');
   });
 
   it('detect_changes scope has correct enum values', () => {

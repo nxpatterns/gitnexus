@@ -6,6 +6,7 @@
 import { Command } from 'commander';
 import { createRequire } from 'node:module';
 import { createLazyAction } from './lazy-action.js';
+import { registerGroupCommands } from './group.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -147,5 +148,7 @@ program
   .option('-p, --port <port>', 'Port number', '4848')
   .option('--idle-timeout <seconds>', 'Auto-shutdown after N seconds idle (0 = disabled)', '0')
   .action(createLazyAction(() => import('./eval-server.js'), 'evalServerCommand'));
+
+registerGroupCommands(program);
 
 program.parse(process.argv);
