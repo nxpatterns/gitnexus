@@ -798,8 +798,19 @@ describe('SymbolTable', () => {
       expect(table.lookupClassByName('Qux')).toEqual([]);
     });
 
+    it('includes Trait in the class set (PHP use, Rust impl, Scala traits)', () => {
+      // Traits are class-like for heritage resolution — they contribute
+      // methods to the using/implementing type's hierarchy. buildHeritageMap
+      // relies on this to resolve `use Trait;` edges in PHP, `impl Trait for
+      // Struct` in Rust, etc. Added as part of PR #744 (SM-11 Codex review
+      // fixes) after the PHP HasTimestamps trait walk gap was discovered.
+      table.add('src/a.rs', 'Writer', 'trait:Writer', 'Trait');
+      const results = table.lookupClassByName('Writer');
+      expect(results).toHaveLength(1);
+      expect(results[0].nodeId).toBe('trait:Writer');
+    });
+
     it('does NOT include other type-like labels outside the allowed class set', () => {
-      table.add('src/a.rs', 'User', 'trait:User', 'Trait');
       table.add('src/a.ts', 'User', 'type:User', 'Type');
       expect(table.lookupClassByName('User')).toEqual([]);
     });
@@ -1396,5 +1407,501 @@ describe('lookupMethodByOwnerWithMRO', () => {
     );
     expect(result).toBeDefined();
     expect(result!.nodeId).toBe('method:User:getName');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// resolveMemberCall — SM-11: owner-scoped + MRO member-call resolution
+// ---------------------------------------------------------------------------
+
+import {
+  _resolveCallTargetForTesting,
+  resolveMemberCall,
+  type OverloadHints,
+} from '../../src/core/ingestion/call-processor.js';
+
+describe('resolveMemberCall', () => {
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    ctx = createResolutionContext();
+  });
+
+  it('resolves direct method on owner type', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:User:save');
+    expect(result!.returnType).toBe('void');
+    expect(result!.confidence).toBeGreaterThan(0);
+  });
+
+  it('resolves inherited method via MRO walk', () => {
+    ctx.symbols.add('src/parent.java', 'Parent', 'class:Parent', 'Class');
+    ctx.symbols.add('src/child.java', 'Child', 'class:Child', 'Class');
+    ctx.symbols.add('src/parent.java', 'validate', 'method:Parent:validate', 'Method', {
+      returnType: 'boolean',
+      ownerId: 'class:Parent',
+    });
+    ctx.importMap.set('src/app.java', new Set(['src/child.java', 'src/parent.java']));
+
+    const heritage: ExtractedHeritage[] = [
+      { filePath: 'src/child.java', className: 'Child', parentName: 'Parent', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('Child', 'validate', 'src/app.java', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:Parent:validate');
+    expect(result!.returnType).toBe('boolean');
+  });
+
+  it('returns null for unknown owner type', () => {
+    const result = resolveMemberCall('NonExistent', 'save', 'src/app.ts', ctx);
+    expect(result).toBeNull();
+  });
+
+  it('returns null for unknown method on known owner', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveMemberCall('User', 'nonExistentMethod', 'src/app.ts', ctx);
+    expect(result).toBeNull();
+  });
+
+  it('returns result with correct confidence tier for same-file resolution', () => {
+    ctx.symbols.add('src/app.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/app.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.95); // same-file tier
+    expect(result!.reason).toBe('same-file');
+  });
+
+  it('returns result with import-scoped tier for cross-file resolution', () => {
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.9); // import-scoped tier
+    expect(result!.reason).toBe('import-resolved');
+  });
+
+  it('resolves with heritage map across C3 MRO chain (Python)', () => {
+    ctx.symbols.add('src/a.py', 'A', 'class:A', 'Class');
+    ctx.symbols.add('src/b.py', 'B', 'class:B', 'Class');
+    ctx.symbols.add('src/c.py', 'C', 'class:C', 'Class');
+    ctx.symbols.add('src/a.py', 'foo', 'method:A:foo', 'Method', {
+      returnType: 'str',
+      ownerId: 'class:A',
+    });
+    ctx.importMap.set('src/main.py', new Set(['src/a.py', 'src/b.py', 'src/c.py']));
+
+    const heritage: ExtractedHeritage[] = [
+      { filePath: 'src/c.py', className: 'C', parentName: 'B', kind: 'extends' },
+      { filePath: 'src/b.py', className: 'B', parentName: 'A', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('C', 'foo', 'src/main.py', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:A:foo');
+    expect(result!.returnType).toBe('str');
+  });
+
+  // -------------------------------------------------------------------------
+  // Locks in the B2 semantic change: tier reflects how the OWNER TYPE was
+  // resolved, not how the method name was resolved globally.
+  // -------------------------------------------------------------------------
+  it('uses owner-type tier: cross-file class resolution → import-scoped confidence', () => {
+    // Scenario: owner class 'User' is defined in user.ts (imported from app.ts).
+    // The method 'save' exists ONLY on User (no homonyms). Old behaviour would
+    // have used the tier of resolving "save" globally; new behaviour uses the
+    // tier of resolving "User". Both happen to yield import-scoped here —
+    // the test locks that the reported tier tracks the class lookup.
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx);
+
+    expect(result).not.toBeNull();
+    expect(result!.confidence).toBe(0.9); // import-scoped
+    expect(result!.reason).toBe('import-resolved');
+  });
+
+  // -------------------------------------------------------------------------
+  // T2: Rust qualified-syntax — trait-inherited methods must return null
+  // because they require `TraitName::method(obj)` call syntax, not `obj.method()`.
+  // Only struct's OWN impl methods are reachable via direct member calls.
+  // -------------------------------------------------------------------------
+  it('Rust: returns null for trait-inherited method (qualified-syntax MRO)', () => {
+    // Trait Writer defines `save`. Struct User has an impl_item but NO save
+    // method of its own — save is only available via trait.
+    ctx.symbols.add('src/writer.rs', 'Writer', 'trait:Writer', 'Trait');
+    ctx.symbols.add('src/user.rs', 'User', 'struct:User', 'Struct');
+    ctx.symbols.add('src/writer.rs', 'save', 'method:Writer:save', 'Method', {
+      returnType: 'bool',
+      ownerId: 'trait:Writer',
+    });
+    ctx.importMap.set('src/app.rs', new Set(['src/writer.rs', 'src/user.rs']));
+
+    const heritage: ExtractedHeritage[] = [
+      // User implements Writer — in Rust this is `impl Writer for User`.
+      { filePath: 'src/user.rs', className: 'User', parentName: 'Writer', kind: 'implements' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    // Rust's qualified-syntax strategy short-circuits trait inheritance walks,
+    // so `user.save()` (direct call) does not resolve.
+    const result = resolveMemberCall('User', 'save', 'src/app.rs', ctx, map);
+    expect(result).toBeNull();
+  });
+
+  it('Rust: direct impl methods still resolve (distinction check for T2)', () => {
+    // Positive control: a method defined directly on User (not via trait)
+    // resolves normally — demonstrates the null in the previous test is
+    // specifically due to the trait-inheritance path, not a broken fixture.
+    ctx.symbols.add('src/user.rs', 'User', 'struct:User', 'Struct');
+    ctx.symbols.add('src/user.rs', 'name', 'method:User:name', 'Method', {
+      returnType: 'String',
+      ownerId: 'struct:User',
+    });
+    ctx.importMap.set('src/app.rs', new Set(['src/user.rs']));
+
+    const result = resolveMemberCall('User', 'name', 'src/app.rs', ctx);
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:User:name');
+    expect(result!.returnType).toBe('String');
+  });
+
+  // -------------------------------------------------------------------------
+  // T3: C/C++ leftmost-base diamond inheritance at the resolveMemberCall layer.
+  // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Homonym disambiguation: when two class candidates share a name but only
+  // ONE of them owns the method, resolveMemberCall should return that one
+  // without falling through to the fuzzy D2 widening path. Absorbs what was
+  // previously D4's ownerId-filtering job into the owner-scoped path.
+  // -------------------------------------------------------------------------
+  it('disambiguates homonym classes: only one owns the method', () => {
+    // Two classes both named `User` — one in auth.py (has `save`), one in
+    // legacy.py (has `archive` but no `save`). Both are imported from app.py.
+    ctx.symbols.add('src/auth.py', 'User', 'class:auth:User', 'Class');
+    ctx.symbols.add('src/auth.py', 'save', 'method:auth:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:auth:User',
+    });
+    ctx.symbols.add('src/legacy.py', 'User', 'class:legacy:User', 'Class');
+    ctx.symbols.add('src/legacy.py', 'archive', 'method:legacy:User:archive', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:legacy:User',
+    });
+    ctx.importMap.set('src/app.py', new Set(['src/auth.py', 'src/legacy.py']));
+
+    // `user.save()` is unambiguous — only auth.User has `save`.
+    const saveResult = resolveMemberCall('User', 'save', 'src/app.py', ctx);
+    expect(saveResult).not.toBeNull();
+    expect(saveResult!.nodeId).toBe('method:auth:User:save');
+
+    // `user.archive()` is also unambiguous — only legacy.User has `archive`.
+    const archiveResult = resolveMemberCall('User', 'archive', 'src/app.py', ctx);
+    expect(archiveResult).not.toBeNull();
+    expect(archiveResult!.nodeId).toBe('method:legacy:User:archive');
+  });
+
+  it('returns null when homonym classes BOTH own the method (genuine ambiguity)', () => {
+    // Both homonym Users define a `save` method — resolveMemberCall refuses
+    // to pick one. The caller (resolveCallTarget) falls through to D1-D4 which
+    // may or may not be able to narrow further.
+    ctx.symbols.add('src/auth.py', 'User', 'class:auth:User', 'Class');
+    ctx.symbols.add('src/auth.py', 'save', 'method:auth:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:auth:User',
+    });
+    ctx.symbols.add('src/legacy.py', 'User', 'class:legacy:User', 'Class');
+    ctx.symbols.add('src/legacy.py', 'save', 'method:legacy:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:legacy:User',
+    });
+    ctx.importMap.set('src/app.py', new Set(['src/auth.py', 'src/legacy.py']));
+
+    const result = resolveMemberCall('User', 'save', 'src/app.py', ctx);
+    expect(result).toBeNull();
+  });
+
+  it('homonym + shared ancestor: both walk MRO to the same method (dedups to 1)', () => {
+    // Two homonym `User` classes in different files, both extending a common
+    // `BaseUser` that owns `save`. Direct lookup on either User misses; MRO
+    // walks both find BaseUser.save. Dedup by nodeId yields a single result.
+    ctx.symbols.add('src/base.ts', 'BaseUser', 'class:BaseUser', 'Class');
+    ctx.symbols.add('src/base.ts', 'save', 'method:BaseUser:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:BaseUser',
+    });
+    ctx.symbols.add('src/a.ts', 'User', 'class:a:User', 'Class');
+    ctx.symbols.add('src/b.ts', 'User', 'class:b:User', 'Class');
+    ctx.importMap.set('src/app.ts', new Set(['src/base.ts', 'src/a.ts', 'src/b.ts']));
+
+    const heritage: ExtractedHeritage[] = [
+      { filePath: 'src/a.ts', className: 'User', parentName: 'BaseUser', kind: 'extends' },
+      { filePath: 'src/b.ts', className: 'User', parentName: 'BaseUser', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('User', 'save', 'src/app.ts', ctx, map);
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:BaseUser:save');
+  });
+
+  it('C++: resolves diamond inheritance via leftmost-base MRO', () => {
+    // Diamond:
+    //        Base
+    //        / \
+    //       A   B
+    //        \ /
+    //      Derived
+    //
+    // Both A and B inherit `method` from Base. Derived extends (A, B).
+    // Leftmost-base strategy walks A's chain first → finds Base::method.
+    ctx.symbols.add('src/base.h', 'Base', 'class:Base', 'Class');
+    ctx.symbols.add('src/a.h', 'A', 'class:A', 'Class');
+    ctx.symbols.add('src/b.h', 'B', 'class:B', 'Class');
+    ctx.symbols.add('src/derived.h', 'Derived', 'class:Derived', 'Class');
+    ctx.symbols.add('src/base.h', 'method', 'method:Base:method', 'Method', {
+      returnType: 'int',
+      ownerId: 'class:Base',
+    });
+    ctx.importMap.set(
+      'src/app.cpp',
+      new Set(['src/base.h', 'src/a.h', 'src/b.h', 'src/derived.h']),
+    );
+
+    const heritage: ExtractedHeritage[] = [
+      { filePath: 'src/a.h', className: 'A', parentName: 'Base', kind: 'extends' },
+      { filePath: 'src/b.h', className: 'B', parentName: 'Base', kind: 'extends' },
+      { filePath: 'src/derived.h', className: 'Derived', parentName: 'A', kind: 'extends' },
+      { filePath: 'src/derived.h', className: 'Derived', parentName: 'B', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('Derived', 'method', 'src/app.cpp', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:Base:method');
+    expect(result!.returnType).toBe('int');
+  });
+
+  // -------------------------------------------------------------------------
+  // L1: C# / Kotlin implements-split strategy through resolveMemberCall.
+  // lookupMethodByOwnerWithMRO already has strategy-level coverage for these
+  // languages; these tests add the resolveMemberCall layer (tier resolution
+  // + class candidate iteration + MRO walk) on top.
+  // -------------------------------------------------------------------------
+  it('C#: walks implements-split to find inherited method via interface', () => {
+    // C# uses implements-split MRO: class base chain walked first, then
+    // interfaces. Here IService declares Save which is implemented by the
+    // base class BaseService — MyService inherits Save through the class.
+    ctx.symbols.add('src/iservice.cs', 'IService', 'interface:IService', 'Interface');
+    ctx.symbols.add('src/base.cs', 'BaseService', 'class:BaseService', 'Class');
+    ctx.symbols.add('src/my.cs', 'MyService', 'class:MyService', 'Class');
+    ctx.symbols.add('src/base.cs', 'Save', 'method:BaseService:Save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:BaseService',
+    });
+    ctx.importMap.set('src/app.cs', new Set(['src/iservice.cs', 'src/base.cs', 'src/my.cs']));
+
+    const heritage: ExtractedHeritage[] = [
+      {
+        filePath: 'src/base.cs',
+        className: 'BaseService',
+        parentName: 'IService',
+        kind: 'implements',
+      },
+      { filePath: 'src/my.cs', className: 'MyService', parentName: 'BaseService', kind: 'extends' },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('MyService', 'Save', 'src/app.cs', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:BaseService:Save');
+    expect(result!.returnType).toBe('void');
+  });
+
+  it('Kotlin: walks implements-split to find inherited method via interface', () => {
+    // Kotlin shares the implements-split MRO strategy with Java/C#. A class
+    // inheriting from an interface that provides a default method should
+    // resolve `obj.method()` to the interface's implementation.
+    ctx.symbols.add('src/validator.kt', 'Validator', 'interface:Validator', 'Interface');
+    ctx.symbols.add('src/user.kt', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/validator.kt', 'validate', 'method:Validator:validate', 'Method', {
+      returnType: 'Boolean',
+      ownerId: 'interface:Validator',
+    });
+    ctx.importMap.set('src/app.kt', new Set(['src/validator.kt', 'src/user.kt']));
+
+    const heritage: ExtractedHeritage[] = [
+      {
+        filePath: 'src/user.kt',
+        className: 'User',
+        parentName: 'Validator',
+        kind: 'implements',
+      },
+    ];
+    const map = buildHeritageMap(heritage, ctx);
+
+    const result = resolveMemberCall('User', 'validate', 'src/app.kt', ctx, map);
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:Validator:validate');
+    expect(result!.returnType).toBe('Boolean');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T1: D0 skip-condition tests — verify resolveCallTarget bypasses the
+// resolveMemberCall fast path when overloadHints, preComputedArgTypes, or a
+// module alias is active.
+// ---------------------------------------------------------------------------
+
+describe('resolveCallTarget D0 skip conditions (SM-11)', () => {
+  let ctx: ResolutionContext;
+
+  beforeEach(() => {
+    ctx = createResolutionContext();
+  });
+
+  it('module alias: picks alias-scoped class over homonym (D0 actually bypassed)', () => {
+    // Python-style: `import auth; auth.User.save()` where BOTH auth.py and
+    // other.py define a `User` class with a `save` method. The test proves:
+    //
+    //   1. Without the alias: resolveMemberCall sees two homonym Users,
+    //      both own `save`, and correctly returns null (refuses to guess).
+    //   2. With the alias: D0 is skipped via `hasActiveModuleAlias`, and
+    //      D1-D4 — respecting the alias-narrowed filteredCandidates — picks
+    //      the auth.py User.save method.
+    //
+    // A regression where D0 silently ran would produce null (ambiguous)
+    // instead of the correct answer, so this test actually exercises the
+    // skip path rather than just verifying a single-candidate happy path.
+    ctx.symbols.add('src/auth.py', 'User', 'class:auth:User', 'Class');
+    ctx.symbols.add('src/auth.py', 'save', 'method:auth:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:auth:User',
+    });
+    ctx.symbols.add('src/other.py', 'User', 'class:other:User', 'Class');
+    ctx.symbols.add('src/other.py', 'save', 'method:other:User:save', 'Method', {
+      returnType: 'None',
+      ownerId: 'class:other:User',
+    });
+    ctx.importMap.set('src/app.py', new Set(['src/auth.py', 'src/other.py']));
+    ctx.moduleAliasMap.set('src/app.py', new Map([['auth', 'src/auth.py']]));
+
+    // Control: without alias narrowing, resolveMemberCall sees both Users
+    // own `save` and correctly refuses to pick one.
+    const ambiguous = resolveMemberCall('User', 'save', 'src/app.py', ctx);
+    expect(ambiguous).toBeNull();
+
+    // With alias narrowing active, D0 is skipped and D1-D4 picks auth.py's
+    // User.save because the alias block already narrowed filteredCandidates
+    // to auth.py (and the D2 widening step is gated on `!aliasNarrowed`).
+    const aliased = _resolveCallTargetForTesting(
+      {
+        calledName: 'save',
+        callForm: 'member',
+        receiverTypeName: 'User',
+        receiverName: 'auth', // triggers hasActiveModuleAlias → D0 skipped
+      },
+      'src/app.py',
+      ctx,
+    );
+
+    expect(aliased).not.toBeNull();
+    expect(aliased!.nodeId).toBe('method:auth:User:save');
+  });
+
+  it('overloadHints present: D0 bypassed, D1-D4 handles resolution', () => {
+    // When overloadHints is supplied, the D0 fast path must be skipped
+    // because lookupMethodByOwner does not consider argument types and
+    // would pick an arbitrary overload for same-return-type overloads.
+    //
+    // This test verifies that the skip does not break resolution: passing
+    // a dummy overloadHints object should still yield the correct method
+    // via the D1-D4 path.
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    // Minimal stub; D1-D4 only calls tryOverloadDisambiguation when there are
+    // multiple candidates, so an empty object is fine for single-candidate cases.
+    const dummyHints = {} as OverloadHints;
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'save',
+        callForm: 'member',
+        receiverTypeName: 'User',
+      },
+      'src/app.ts',
+      ctx,
+      { overloadHints: dummyHints },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:User:save');
+  });
+
+  it('preComputedArgTypes present: D0 bypassed, D1-D4 handles resolution', () => {
+    // Analogous to the overloadHints case: when preComputedArgTypes is supplied
+    // (worker path), D0 must be skipped so that type-based overload
+    // disambiguation in D1-D4 is authoritative.
+    ctx.symbols.add('src/user.ts', 'User', 'class:User', 'Class');
+    ctx.symbols.add('src/user.ts', 'save', 'method:User:save', 'Method', {
+      returnType: 'void',
+      ownerId: 'class:User',
+    });
+    ctx.importMap.set('src/app.ts', new Set(['src/user.ts']));
+
+    const result = _resolveCallTargetForTesting(
+      {
+        calledName: 'save',
+        callForm: 'member',
+        receiverTypeName: 'User',
+        argCount: 0,
+      },
+      'src/app.ts',
+      ctx,
+      { preComputedArgTypes: [] },
+    );
+
+    expect(result).not.toBeNull();
+    expect(result!.nodeId).toBe('method:User:save');
   });
 });

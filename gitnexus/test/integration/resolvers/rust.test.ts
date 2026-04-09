@@ -1857,3 +1857,66 @@ describe('Rust abstract dispatch (Repository trait)', () => {
     expect(names).toEqual(['find', 'save']);
   });
 });
+
+// ---------------------------------------------------------------------------
+// SM-11: Rust Child extends Parent — qualified-syntax MRO
+//
+// Companion integration test for the unit-level Rust qualified-syntax tests
+// in symbol-table.test.ts. Validates end-to-end that:
+//
+//   1. Direct `impl` methods on a struct resolve through the D0 owner-scoped
+//      path (`resolveMemberCall`) — the positive control.
+//
+//   2. Trait-inherited default methods are NOT reachable via direct
+//      `obj.trait_method()` syntax. Rust requires the trait to be in scope
+//      and uses qualified syntax for trait dispatch; the resolver correctly
+//      treats direct member calls as opaque to trait ancestry.
+//
+//      Previously this case emitted a false-positive CALLS edge via the
+//      permissive tail-return in resolveCallTarget — Codex review finding
+//      R3 (PR #744). The tail-return is now null-routed when D1-D4 receiver
+//      filtering produces zero matches on both file and owner dimensions.
+// ---------------------------------------------------------------------------
+
+describe('Rust Child extends Parent — qualified-syntax MRO (SM-11)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'rust-child-extends-parent'), () => {});
+  }, 60000);
+
+  it('detects Child struct and Parent trait', () => {
+    const structs = getNodesByLabel(result, 'Struct');
+    expect(structs).toContain('Child');
+    const traits = getNodesByLabel(result, 'Trait');
+    expect(traits).toContain('Parent');
+  });
+
+  it('resolves c.own_method() to Child::own_method via D0 owner-scoped path', () => {
+    // Direct impl method — D0 short-circuits to lookupMethodByOwner which
+    // returns Child::own_method without falling through to D1-D4 fuzzy.
+    const calls = getRelationships(result, 'CALLS');
+    const ownCall = calls.find(
+      (c) =>
+        c.target === 'own_method' && c.source === 'run' && c.targetFilePath.includes('child.rs'),
+    );
+    expect(ownCall).toBeDefined();
+  });
+
+  it('does NOT resolve c.trait_only() to Parent::trait_only via direct member call', () => {
+    // Qualified-syntax MRO: direct member calls on structs do not walk trait
+    // ancestry. `c.trait_only()` must null-route because `trait_only` is
+    // defined on the trait, not on the Child struct.
+    //
+    // The resolveCallTarget tail-return tightening (R3) is what makes this
+    // assertion testable: before the fix, resolveCallTarget would fall
+    // through D1-D4 (zero file matches, zero owner matches) and silently
+    // pick the single fuzzy candidate as a false-positive edge.
+    const calls = getRelationships(result, 'CALLS');
+    const traitCall = calls.find(
+      (c) =>
+        c.target === 'trait_only' && c.source === 'run' && c.targetFilePath.includes('parent.rs'),
+    );
+    expect(traitCall).toBeUndefined();
+  });
+});

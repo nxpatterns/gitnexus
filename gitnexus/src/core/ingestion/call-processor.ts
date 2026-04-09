@@ -1191,9 +1191,15 @@ const toResolveResult = (definition: SymbolDefinition, tier: ResolutionTier): Re
   returnType: definition.returnType,
 });
 
-/** Optional hints for overload disambiguation via argument literal types.
- *  Only available on the sequential path (has AST); worker path passes undefined. */
-interface OverloadHints {
+/**
+ * Optional hints for overload disambiguation via argument literal types.
+ * Only available on the sequential path (has AST); worker path passes undefined.
+ *
+ * @internal Exported so tests can exercise the D0 skip-condition path without
+ *           constructing a real SyntaxNode. Do not use outside `call-processor.ts`
+ *           and its unit tests.
+ */
+export interface OverloadHints {
   callNode: SyntaxNode;
   inferLiteralType: LiteralTypeInferrer;
   typeEnv?: TypeEnvironment;
@@ -1279,6 +1285,31 @@ const tryOverloadDisambiguation = (
 /** Per-file cache for the widen path's lookupFuzzy calls. Cleared between files. */
 type WidenCache = Map<string, readonly SymbolDefinition[]>;
 
+/** @internal Exported for unit tests of D0 skip conditions (SM-11). Do not use outside tests. */
+export const _resolveCallTargetForTesting = (
+  call: Pick<
+    ExtractedCall,
+    'calledName' | 'argCount' | 'callForm' | 'receiverTypeName' | 'receiverName'
+  >,
+  currentFile: string,
+  ctx: ResolutionContext,
+  opts?: {
+    overloadHints?: OverloadHints;
+    widenCache?: WidenCache;
+    preComputedArgTypes?: (string | undefined)[];
+    heritageMap?: HeritageMap;
+  },
+): ResolveResult | null =>
+  resolveCallTarget(
+    call,
+    currentFile,
+    ctx,
+    opts?.overloadHints,
+    opts?.widenCache,
+    opts?.preComputedArgTypes,
+    opts?.heritageMap,
+  );
+
 const resolveCallTarget = (
   call: Pick<
     ExtractedCall,
@@ -1328,6 +1359,10 @@ const resolveCallTarget = (
   // selects auth.py via moduleAliasMap. Runs for ALL member calls with a known module alias,
   // not just ambiguous ones — same-file tier may shadow the correct cross-module target when
   // the caller defines a function with the same name as the callee (Issue #417).
+  //
+  // Tracks `aliasNarrowed` so the D2 widening step below does NOT undo the alias filtering
+  // by calling lookupFuzzy again (which would re-introduce homonym candidates from other files).
+  let aliasNarrowed = false;
   if (call.callForm === 'member' && call.receiverName) {
     const aliasMap = ctx.moduleAliasMap?.get(currentFile);
     if (aliasMap) {
@@ -1336,6 +1371,7 @@ const resolveCallTarget = (
         const aliasFiltered = filteredCandidates.filter((c) => c.filePath === moduleFile);
         if (aliasFiltered.length > 0) {
           filteredCandidates = aliasFiltered;
+          aliasNarrowed = true;
         } else {
           // Same-file tier returned a local match, but the alias points elsewhere.
           // Widen to global candidates and filter to the aliased module's file.
@@ -1350,7 +1386,10 @@ const resolveCallTarget = (
           const widened = filterCallableCandidates(fuzzyDefs, call.argCount, call.callForm).filter(
             (c) => c.filePath === moduleFile,
           );
-          if (widened.length > 0) filteredCandidates = widened;
+          if (widened.length > 0) {
+            filteredCandidates = widened;
+            aliasNarrowed = true;
+          }
         }
       }
     }
@@ -1365,33 +1404,45 @@ const resolveCallTarget = (
   // belong to the wrong class (e.g. super.save() should hit the parent's save,
   // not the child's own save method in the same file).
   if (call.callForm === 'member' && call.receiverTypeName) {
-    // D0. MRO fast path: when heritageMap is available, try owner-scoped + MRO
-    //     lookup before falling back to the expensive D2 fuzzy widening.
-    //     This short-circuits the lookupFuzzy call for every cross-file member call.
+    // D0. Delegate to resolveMemberCall (SM-11): owner-scoped + MRO lookup
+    //     before falling back to the expensive D1-D4 fuzzy widening.
     //     Skip conditions:
     //     (a) overloadHints or preComputedArgTypes present — the MRO lookup may
     //         pick the wrong overload for same-return-type overloads since it
-    //         does not consider argument types. D2-D4+E handles those correctly.
+    //         does not consider argument types. D1-D4+E handles those correctly.
     //     (b) A module alias on call.receiverName is active for this file — the
     //         alias block above already narrowed `filteredCandidates` to a
-    //         specific file (e.g. Python `import auth; auth.user.save()`).
-    //         resolveMethodByOwner re-resolves `receiverTypeName` from scratch
-    //         via `ctx.resolve`, which ignores that narrowing and could pick a
-    //         homonymous class from the wrong file. Fall through to D1-D4 which
-    //         respects the alias-filtered candidate pool.
-    const hasActiveModuleAlias =
-      !!call.receiverName && ctx.moduleAliasMap?.get(currentFile)?.has(call.receiverName) === true;
-    if (!overloadHints && !preComputedArgTypes && !hasActiveModuleAlias) {
-      const mroResult = resolveMethodByOwner(
+    //         specific file. resolveMemberCall re-resolves `receiverTypeName`
+    //         from scratch via `ctx.resolve`, which ignores that narrowing and
+    //         could pick a homonymous class from the wrong file. Fall through to
+    //         D1-D4 which respects the alias-filtered candidate pool.
+    // D0 skip for overload disambiguation: only fires when the name actually
+    // has multiple candidates in the tiered pool. The sequential path sets
+    // `overloadHints` for every call regardless of whether the method is
+    // overloaded — skipping D0 unconditionally would make this fast path
+    // dead code for the sequential pipeline. By gating on
+    // `filteredCandidates.length > 1`, we preserve the original intent
+    // (let D1-D4+E pick the right overload when there are multiple) while
+    // allowing D0 to fire for the common single-candidate case.
+    const hasOverloadConcern =
+      (!!overloadHints || !!preComputedArgTypes) && filteredCandidates.length > 1;
+    // D0 skip for active module alias: only fires when the alias block above
+    // actually narrowed filteredCandidates. In Python, a local variable can
+    // shadow an imported module name (e.g. `from models.c import C; c = C()`
+    // creates both a module alias `c → models/c.py` AND a typed local `c`).
+    // Checking `aliasNarrowed` rather than `ctx.moduleAliasMap.has(receiverName)`
+    // ensures D0 still runs when the method isn't in the aliased module —
+    // which means the receiver is a typed local variable, not a module reference.
+    if (!hasOverloadConcern && !aliasNarrowed) {
+      const memberResult = resolveMemberCall(
         call.receiverTypeName,
         call.calledName,
         currentFile,
         ctx,
         heritageMap,
+        call.argCount,
       );
-      if (mroResult) {
-        return toResolveResult(mroResult, tiered.tier);
-      }
+      if (memberResult) return memberResult;
     }
 
     // D1. Resolve the receiver type
@@ -1403,8 +1454,13 @@ const resolveCallTarget = (
       // D2. Widen candidates: same-file tier may miss the parent's method when
       //     it lives in another file. Query the symbol table directly for all
       //     global methods with this name, then apply arity/kind filtering.
+      //
+      //     When the candidate set was already narrowed by module-alias
+      //     disambiguation, do NOT widen back to the full fuzzy pool — that
+      //     would undo the alias narrowing and reintroduce homonym candidates
+      //     from other files.
       const methodPool =
-        filteredCandidates.length <= 1
+        filteredCandidates.length <= 1 && !aliasNarrowed
           ? filterCallableCandidates(
               ctx.symbols.lookupFuzzy(call.calledName),
               call.argCount,
@@ -1433,6 +1489,23 @@ const resolveCallTarget = (
             ? matchCandidatesByArgTypes(overloadPool, preComputedArgTypes)
             : null;
         if (disambiguated) return toResolveResult(disambiguated, tiered.tier);
+        return null;
+      }
+
+      // Zero-match null-route: we committed to receiver narrowing (D1 succeeded)
+      // but both file-based (D3) and owner-based (D4) filters produced zero
+      // matches. The lone candidate in `filteredCandidates` does not belong to
+      // this receiver type — refuse to emit a CALLS edge rather than fall
+      // through to the permissive single-candidate tail return.
+      //
+      // Addresses Codex review finding R3 (PR #744): member calls where
+      // fuzzy fallback picked a globally-matching symbol that has no
+      // relationship to the receiver's class hierarchy were silently
+      // producing false-positive edges. Example: Rust `c.trait_only()` where
+      // `trait_only` is captured as a Function node with no ownerId — it
+      // matches the name but fails both file and owner narrowing, so the
+      // old tail return would pick it incorrectly.
+      if (fileFiltered.length === 0 && ownerFiltered.length === 0) {
         return null;
       }
     }
@@ -1630,9 +1703,33 @@ const resolveFieldOwnership = (
 
 /**
  * Resolve a method by owner type name using the eagerly-populated methodByOwner index.
- * Returns the SymbolDefinition if an unambiguous method is found, undefined otherwise.
- * Falls through to undefined for: unknown type, no class-like candidates, ambiguous overloads.
- * When heritageMap is provided, falls back to MRO-aware parent chain walking.
+ * Returns `{ def, tier }` when an unambiguous method is found, `undefined` otherwise.
+ *
+ * **Multi-candidate iteration (homonym disambiguation):** when `ctx.resolve(ownerType)`
+ * returns multiple class-like candidates (e.g. two classes named `User` in different
+ * files reachable from the call site), each is probed with `lookupMethodByOwnerWithMRO`.
+ * Results are deduplicated by `nodeId` so that:
+ *
+ *   - homonym classes that both walk up to the SAME ancestor's method collapse to 1 hit
+ *   - aliased re-exports that produce two candidates pointing at the same def collapse too
+ *
+ * After deduplication:
+ *
+ *   - 0 unique matches → `undefined` (owner-scoped path has no answer; D1-D4 fuzzy
+ *     fallback in `resolveCallTarget` may still find something via lookupFuzzy)
+ *   - 1 unique match   → return it
+ *   - ≥2 unique matches → `undefined` (genuine homonym ambiguity; don't silently pick one)
+ *
+ * This absorbs what was previously D4's job inside `resolveCallTarget` — "filter fuzzy
+ * candidates to those whose ownerId is in the receiver type's nodeId set" — into the
+ * owner-scoped path, aligning with the plan's target:
+ *
+ *     `resolveCallTarget` D2 widening → `model.lookupMethodWithMRO(ownerNodeId, name)`
+ *
+ * The returned `tier` reflects how the owner TYPE was resolved (not the method name).
+ * Threaded out here so callers don't need a second `ctx.resolve(ownerType, ...)` call —
+ * this decouples callers from `ctx.resolve`'s per-file caching contract, which SM-16
+ * will restructure when it replaces the `lookupFuzzy` data source.
  */
 const resolveMethodByOwner = (
   receiverTypeName: string,
@@ -1640,35 +1737,110 @@ const resolveMethodByOwner = (
   filePath: string,
   ctx: ResolutionContext,
   heritageMap?: HeritageMap,
-): SymbolDefinition | undefined => {
+  argCount?: number,
+): { def: SymbolDefinition; tier: ResolutionTier } | undefined => {
   const typeResolved = ctx.resolve(receiverTypeName, filePath);
   if (!typeResolved) return undefined;
-  const classDef = typeResolved.candidates.find((d) => CLASS_LIKE_TYPES.has(d.type));
-  if (!classDef) return undefined;
 
-  // When HeritageMap is available, delegate to MRO-aware lookup which performs
-  // the direct owner lookup itself before walking ancestors — avoids a double
-  // direct lookup on the hot path.
-  if (heritageMap) {
-    const language = getLanguageFromFilename(filePath);
-    if (language) {
-      return lookupMethodByOwnerWithMRO(
-        classDef.nodeId,
-        methodName,
-        heritageMap,
-        ctx.symbols,
-        language,
-      );
+  // MRO walking needs a language hint; compute once and reuse for every candidate.
+  // Unknown extension → fall back to plain direct lookup (D1-D4 still runs on miss).
+  const language = heritageMap ? getLanguageFromFilename(filePath) : null;
+  const canWalkMRO = heritageMap != null && language != null;
+
+  // Iterate all class-like candidates tracking the first unambiguous hit.
+  // Zero-allocation fast path: the common case is exactly one class candidate,
+  // so we avoid building a Map. A second hit with a different `nodeId` flips
+  // `ambiguous` and short-circuits the loop. Diamond MRO convergence on the
+  // same inherited method collapses to one hit because `nodeId` matches.
+  //
+  //   firstDef === undefined → owner-scoped resolution found nothing
+  //   firstDef && !ambiguous → unambiguous answer
+  //   ambiguous              → genuine homonym ambiguity — refuse to pick
+  //
+  // argCount is threaded through so arity-differing overloads
+  // (e.g. C++ `greet()` vs `greet(string)`) are disambiguated inside the
+  // owner-scoped lookup rather than collapsing to an arbitrary first pick.
+  let firstDef: SymbolDefinition | undefined;
+  let ambiguous = false;
+  for (const candidate of typeResolved.candidates) {
+    if (!CLASS_LIKE_TYPES.has(candidate.type)) continue;
+    const def = canWalkMRO
+      ? lookupMethodByOwnerWithMRO(
+          candidate.nodeId,
+          methodName,
+          heritageMap,
+          ctx.symbols,
+          language,
+          argCount,
+        )
+      : ctx.symbols.lookupMethodByOwner(candidate.nodeId, methodName, argCount);
+    if (!def) continue;
+    if (!firstDef) {
+      firstDef = def;
+    } else if (def.nodeId !== firstDef.nodeId) {
+      ambiguous = true;
+      break;
     }
   }
 
-  // Fallback when no HeritageMap (or the file extension is unrecognized by
-  // `getLanguageFromFilename`, e.g. a synthetic path or an extension that is
-  // not registered in supported-languages.ts): plain direct lookup with no
-  // ancestor walk. All primary languages register their extensions, so this
-  // branch is only reached for edge cases where the MRO walk would not be
-  // applicable anyway. D1-D4 in resolveCallTarget still runs on D0 miss.
-  return ctx.symbols.lookupMethodByOwner(classDef.nodeId, methodName);
+  if (!firstDef || ambiguous) return undefined;
+  return { def: firstDef, tier: typeResolved.tier };
+};
+
+// ---------------------------------------------------------------------------
+// SM-11: Owner-scoped + MRO member-call resolution (no fuzzy lookup)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve a member call using owner-scoped + MRO resolution only (no fuzzy lookup).
+ * Used for `obj.method()` calls where the receiver type is known.
+ *
+ * Delegates to {@link resolveMethodByOwner} which performs an O(1) owner-scoped
+ * method lookup and, when a {@link HeritageMap} is provided, walks the MRO chain
+ * via {@link lookupMethodByOwnerWithMRO}.
+ *
+ * {@link resolveCallTarget} delegates here for member calls before falling back
+ * to the more expensive fuzzy-widening path (D1-D4).
+ *
+ * **SEMANTIC CHANGE (2026-04-09):** The confidence tier now reflects how the
+ * owner TYPE was resolved, not how the method NAME was resolved globally. The
+ * previous D0 fast path in `resolveCallTarget` used `tiered.tier` from
+ * `ctx.resolve(calledName, ...)` — a name-based tier that matched what D1-D4
+ * fuzzy widening would produce. The new tier is owner-type-based, which is
+ * more accurate for owner-scoped resolution (the discriminant IS the class,
+ * not the method name). Downstream consumers that filter CALLS edges by
+ * confidence threshold may see shifted values on otherwise-unchanged code.
+ * See the "returns result with correct confidence tier" tests below for the
+ * locked-in behavior.
+ *
+ * **Performance:** Callers that only need the return type (e.g. `walkMixedChain`)
+ * should call {@link resolveMethodByOwner} directly and use the `.def.returnType`
+ * field instead, to avoid building a throwaway `ResolveResult`.
+ *
+ * @param ownerType   - The receiver's type name (e.g. 'User')
+ * @param methodName  - The method being called (e.g. 'save')
+ * @param currentFile - File path of the call site
+ * @param ctx         - Resolution context
+ * @param heritageMap - Optional heritage map for MRO-aware ancestor walking
+ */
+export const resolveMemberCall = (
+  ownerType: string,
+  methodName: string,
+  currentFile: string,
+  ctx: ResolutionContext,
+  heritageMap?: HeritageMap,
+  argCount?: number,
+): ResolveResult | null => {
+  const resolved = resolveMethodByOwner(
+    ownerType,
+    methodName,
+    currentFile,
+    ctx,
+    heritageMap,
+    argCount,
+  );
+  if (!resolved) return null;
+  return toResolveResult(resolved.def, resolved.tier);
 };
 
 // ---------------------------------------------------------------------------
@@ -1761,9 +1933,12 @@ export const lookupMethodByOwnerWithMRO = (
   heritageMap: HeritageMap,
   symbols: SymbolTable,
   language: SupportedLanguages,
+  argCount?: number,
 ): SymbolDefinition | undefined => {
-  // Direct lookup first (child override — no walk needed)
-  const direct = symbols.lookupMethodByOwner(ownerNodeId, methodName);
+  // Direct lookup first (child override — no walk needed).
+  // argCount is threaded through so arity-differing overloads on the direct
+  // owner can be disambiguated before the MRO walk starts.
+  const direct = symbols.lookupMethodByOwner(ownerNodeId, methodName, argCount);
   if (direct) return direct;
 
   const strategy = getProvider(language).mroStrategy;
@@ -1790,9 +1965,10 @@ export const lookupMethodByOwnerWithMRO = (
     ancestors = heritageMap.getAncestors(ownerNodeId);
   }
 
-  // Walk ancestors in MRO order — first match wins
+  // Walk ancestors in MRO order — first match wins.
+  // argCount narrows overloaded ancestors the same way as the direct lookup.
   for (const ancestorId of ancestors) {
-    const method = symbols.lookupMethodByOwner(ancestorId, methodName);
+    const method = symbols.lookupMethodByOwner(ancestorId, methodName, argCount);
     if (method) return method;
   }
 
@@ -1861,12 +2037,16 @@ const walkMixedChain = (
         continue;
       }
       // Fast path: O(1) owner-scoped method lookup via methodByOwner index.
-      // Avoids fuzzy lookup when the owner type is known and the method is unambiguous.
       // Note: CALLS edges for intermediate chain steps are NOT emitted here — walkMixedChain
       // only threads types. CALLS edges come from the outer per-call-expression loop in processCalls.
-      const methodDef = resolveMethodByOwner(currentType, step.name, filePath, ctx, heritageMap);
-      if (methodDef?.returnType) {
-        const fastRetType = extractReturnTypeName(methodDef.returnType);
+      //
+      // We call `resolveMethodByOwner` directly (NOT `resolveMemberCall`) because this is
+      // a hot path — called per chain step per call expression — and we only need the
+      // return type string. Going through `resolveMemberCall` would allocate a throwaway
+      // `ResolveResult` with confidence/reason that we immediately discard.
+      const owned = resolveMethodByOwner(currentType, step.name, filePath, ctx, heritageMap);
+      if (owned?.def.returnType) {
+        const fastRetType = extractReturnTypeName(owned.def.returnType);
         if (fastRetType) {
           currentType = fastRetType;
           continue;
