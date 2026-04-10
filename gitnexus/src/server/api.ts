@@ -442,6 +442,22 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   );
   app.use(express.json({ limit: '10mb' }));
 
+  // Support Chromium Private Network Access (required since Chrome 130+).
+  // Without this header, Chrome/Edge/Brave/Arc block public->loopback requests
+  // which breaks bridge mode entirely.
+  app.use((_req, res, next) => {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    next();
+  });
+
+  // Handle PNA preflight: Chromium sends Access-Control-Request-Private-Network
+  // on OPTIONS requests and expects the allow header in the response.
+  // Note: the actual Allow-Private-Network header is already set by the global
+  // middleware above, so we just need to call next() here.
+  app.options('*', (_req, res, next) => {
+    next();
+  });
+
   // Initialize MCP backend (multi-repo, shared across all MCP sessions)
   const backend = new LocalBackend();
   await backend.init();

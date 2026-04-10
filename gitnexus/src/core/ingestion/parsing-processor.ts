@@ -239,7 +239,12 @@ const seqMethodMapCache = new Map<
 function seqFindEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
   let current = node.parent;
   while (current) {
-    if (CLASS_CONTAINER_TYPES.has(current.type)) return current;
+    if (CLASS_CONTAINER_TYPES.has(current.type)) {
+      // Return singleton_class directly so the method extractor sees it as
+      // the owner node and correctly marks methods as static. Name resolution
+      // for qualified names is handled separately by findEnclosingClassInfo.
+      return current;
+    }
     current = current.parent;
   }
   return null;

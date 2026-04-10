@@ -378,12 +378,9 @@ function findEnclosingClassNode(node: SyntaxNode): SyntaxNode | null {
   let current = node.parent;
   while (current) {
     if (CLASS_CONTAINER_TYPES.has(current.type)) {
-      // Ruby singleton_class (class << self) has no name field — walk up to
-      // the enclosing class/module so the caller gets a node with a findable name.
-      if (current.type === 'singleton_class') {
-        current = current.parent;
-        continue;
-      }
+      // Return singleton_class directly so the method extractor sees it as
+      // the owner node and correctly marks methods as static. Name resolution
+      // for qualified names is handled separately by findEnclosingClassInfo.
       return current;
     }
     current = current.parent;
@@ -841,6 +838,23 @@ const EXPRESS_ROUTE_METHODS = new Set([
 // function is captured separately by the route.fetch query.
 const HTTP_CLIENT_ONLY_METHODS = new Set(['head', 'options', 'request', 'ajax']);
 
+// Known HTTP client receivers u2014 skip these, they're API consumers not routes
+const HTTP_CLIENT_RECEIVERS = new Set([
+  'axios',
+  'request',
+  'fetch',
+  'http',
+  'https',
+  'got',
+  'ky',
+  'superagent',
+  'needle',
+  'undici',
+  'apiclient',
+  'client',
+  'httpclient',
+]);
+
 // Decorator names that indicate HTTP route handlers (NestJS, Flask, FastAPI, Spring)
 const ROUTE_DECORATOR_NAMES = new Set([
   'Get',
@@ -1178,24 +1192,38 @@ function extractLaravelRoutes(tree: Parser.Tree, filePath: string): ExtractedRou
     }
   }
 
-  function walk(node: SyntaxNode, groupStack: RouteGroupContext[]) {
+  // Iterative traversal using an explicit stack to avoid V8 call stack overflow
+  // on deeply nested ASTs (e.g. Go stdlib, large Grafana components).
+  // Each frame tracks the node and a snapshot of the group stack at that depth.
+  interface WalkFrame {
+    node: SyntaxNode;
+    groupSnapshot: RouteGroupContext[];
+  }
+
+  const walkStack: WalkFrame[] = [{ node: tree.rootNode, groupSnapshot: [] }];
+
+  while (walkStack.length > 0) {
+    const { node, groupSnapshot } = walkStack.pop()!;
+
     // Case 1: Simple Route::get(...), Route::post(...), etc.
     if (isRouteStaticCall(node)) {
       const method = getCallMethodName(node);
       if (method && (ROUTE_HTTP_METHODS.has(method) || ROUTE_RESOURCE_METHODS.has(method))) {
-        emitRoute(method, getArguments(node), node.startPosition.row, groupStack, []);
-        return;
+        emitRoute(method, getArguments(node), node.startPosition.row, groupSnapshot, []);
+        continue;
       }
       if (method === 'group') {
         const argsNode = getArguments(node);
         const groupCtx = parseArrayGroupArgs(argsNode);
         const body = findClosureBody(argsNode);
         if (body) {
-          groupStack.push(groupCtx);
-          walkChildren(body, groupStack);
-          groupStack.pop();
+          const childSnapshot = [...groupSnapshot, groupCtx];
+          const children = body.children ?? [];
+          for (let i = children.length - 1; i >= 0; i--) {
+            walkStack.push({ node: children[i], groupSnapshot: childSnapshot });
+          }
         }
-        return;
+        continue;
       }
     }
 
@@ -1212,11 +1240,13 @@ function extractLaravelRoutes(tree: Parser.Tree, filePath: string): ExtractedRou
         }
         const body = findClosureBody(chain.terminalArgs);
         if (body) {
-          groupStack.push(groupCtx);
-          walkChildren(body, groupStack);
-          groupStack.pop();
+          const childSnapshot = [...groupSnapshot, groupCtx];
+          const children = body.children ?? [];
+          for (let i = children.length - 1; i >= 0; i--) {
+            walkStack.push({ node: children[i], groupSnapshot: childSnapshot });
+          }
         }
-        return;
+        continue;
       }
       if (
         ROUTE_HTTP_METHODS.has(chain.terminalMethod) ||
@@ -1226,24 +1256,19 @@ function extractLaravelRoutes(tree: Parser.Tree, filePath: string): ExtractedRou
           chain.terminalMethod,
           chain.terminalArgs,
           node.startPosition.row,
-          groupStack,
+          groupSnapshot,
           chain.attributes,
         );
-        return;
+        continue;
       }
     }
 
-    // Default: recurse into children
-    walkChildren(node, groupStack);
-  }
-
-  function walkChildren(node: SyntaxNode, groupStack: RouteGroupContext[]) {
-    for (const child of node.children ?? []) {
-      walk(child, groupStack);
+    // Default: push children in reverse so leftmost is processed first
+    const children = node.children ?? [];
+    for (let i = children.length - 1; i >= 0; i--) {
+      walkStack.push({ node: children[i], groupSnapshot });
     }
   }
-
-  walk(tree.rootNode, []);
   return routes;
 }
 
@@ -1558,6 +1583,19 @@ const processFileGroup = (
         const method = captureMap['express_route.method'].text;
         const routePath = captureMap['express_route.path'].text;
         if (EXPRESS_ROUTE_METHODS.has(method) && routePath.startsWith('/')) {
+          // Extract the receiver (the object the method is called on) to filter out
+          // HTTP client calls like axios.get('/api/users') that match the same pattern
+          // as Express route registrations.
+          const callNode = captureMap['express_route'];
+          const funcNode = callNode.childForFieldName?.('function') ?? callNode.children?.[0];
+          const receiverNode = funcNode?.childForFieldName?.('object') ?? funcNode?.children?.[0];
+          const receiverText = receiverNode?.text?.toLowerCase() ?? '';
+
+          if (HTTP_CLIENT_RECEIVERS.has(receiverText)) {
+            // This is an HTTP client call, not a route definition u2014 skip it
+            continue;
+          }
+
           const httpMethod =
             method === 'all' || method === 'use' || method === 'route'
               ? 'GET'
@@ -2151,21 +2189,28 @@ let accumulated: ParseWorkerResult = {
 };
 let cumulativeProcessed = 0;
 
+// Use a loop instead of push(...spread) to avoid hitting V8's argument limit
+// when merging large result sets (push(...arr) calls apply() under the hood
+// and blows the stack when arr has >~65k elements).
+const appendAll = <T>(target: T[], src: T[]) => {
+  for (let i = 0; i < src.length; i++) target.push(src[i]);
+};
+
 const mergeResult = (target: ParseWorkerResult, src: ParseWorkerResult) => {
-  target.nodes.push(...src.nodes);
-  target.relationships.push(...src.relationships);
-  target.symbols.push(...src.symbols);
-  target.imports.push(...src.imports);
-  target.calls.push(...src.calls);
-  target.assignments.push(...src.assignments);
-  target.heritage.push(...src.heritage);
-  target.routes.push(...src.routes);
-  target.fetchCalls.push(...src.fetchCalls);
-  target.decoratorRoutes.push(...src.decoratorRoutes);
-  target.toolDefs.push(...src.toolDefs);
-  target.ormQueries.push(...src.ormQueries);
-  target.constructorBindings.push(...src.constructorBindings);
-  target.fileScopeBindings.push(...src.fileScopeBindings);
+  appendAll(target.nodes, src.nodes);
+  appendAll(target.relationships, src.relationships);
+  appendAll(target.symbols, src.symbols);
+  appendAll(target.imports, src.imports);
+  appendAll(target.calls, src.calls);
+  appendAll(target.assignments, src.assignments);
+  appendAll(target.heritage, src.heritage);
+  appendAll(target.routes, src.routes);
+  appendAll(target.fetchCalls, src.fetchCalls);
+  appendAll(target.decoratorRoutes, src.decoratorRoutes);
+  appendAll(target.toolDefs, src.toolDefs);
+  appendAll(target.ormQueries, src.ormQueries);
+  appendAll(target.constructorBindings, src.constructorBindings);
+  appendAll(target.fileScopeBindings, src.fileScopeBindings);
   for (const [lang, count] of Object.entries(src.skippedLanguages)) {
     target.skippedLanguages[lang] = (target.skippedLanguages[lang] || 0) + count;
   }
