@@ -451,10 +451,14 @@ export const STALE_HASH_SENTINEL = '';
 
 export const EMBEDDING_SCHEMA = `
 CREATE NODE TABLE ${EMBEDDING_TABLE_NAME} (
+  id STRING,
   nodeId STRING,
+  chunkIndex INT32,
+  startLine INT64,
+  endLine INT64,
   embedding FLOAT[${EMBEDDING_DIMS}],
   contentHash STRING,
-  PRIMARY KEY (nodeId)
+  PRIMARY KEY (id)
 )`;
 
 /**
